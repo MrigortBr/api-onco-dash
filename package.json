@@ -28,7 +28,8 @@
     "seed:usuarios": "tsx src/database/seeds/seed-usuarios.ts",
     "seed:usuarios:prod": "node dist/database/seeds/seed-usuarios.js",
     "conta:registrar": "tsx src/database/scripts/registrar-conta.ts",
-    "conta:registrar:prod": "node dist/database/scripts/registrar-conta.js"
+    "conta:registrar:prod": "node dist/database/scripts/registrar-conta.js",
+    "territorio:carregar": "tsx src/database/scripts/carregar-territorio.ts"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",
@@ -52,7 +53,8 @@
     "pg": "^8.23.1",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
-    "typeorm": "^1.1.3"
+    "typeorm": "^1.1.3",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@nestjs/cli": "^12.0.0",

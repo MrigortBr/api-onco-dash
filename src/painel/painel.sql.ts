@@ -2,11 +2,10 @@
  * Uma linha por solicitação, no formato do protótipo (as 41 colunas que as
  * abas do painel usam), montada a partir do clone `apac`.
  *
- * O que ainda não existe no banco do APAC Onco fica NULL e aparece como
- * "Não informado" no painel: macrorregião, região de saúde e município do
- * serviço, tipo do serviço (CACON/UNACON), região de saúde de residência,
- * coordenadas e distância. Chegam quando as tabelas de território/CNES forem
- * incorporadas.
+ * Território (macro, região de saúde, município e tipo do serviço,
+ * coordenadas e distância) vem do schema `territorio`, carregado pelo
+ * `npm run territorio:carregar` a partir das planilhas do CNES. O que não
+ * estiver lá fica NULL e aparece como "Não informado" no painel.
  */
 export const COLUNAS_PAINEL = [
   'id', 'paciente', 'data_diagnostico', 'data_solicitacao', 'data_envio', 'data_decisao', 'situacao',
@@ -36,6 +35,30 @@ const REGIAO_POR_UF = `CASE
   WHEN s.sg_uf_estabelecimento IN ('DF','GO','MS','MT') THEN 'Centro-Oeste'
   WHEN s.sg_uf_estabelecimento IN ('ES','MG','RJ','SP') THEN 'Sudeste'
   WHEN s.sg_uf_estabelecimento IN ('PR','RS','SC') THEN 'Sul' END`;
+
+/**
+ * Classe do HER2 (0, 1+, 2+, 3+). O código da tb_resultado_her2 pode vir
+ * como "2+", "2", "DOIS_MAIS", "Positivo 2+"...: olha o código e a descrição
+ * juntos, sem acento e em minúsculas, e procura o número de cruzes.
+ */
+const HER2_TXT = `translate(lower(COALESCE(h.sg_codigo, '') || ' ' || COALESCE(h.ds_resultado_her2, '')), 'áâãàéêíóôõúç', 'aaaaeeiooouc')`;
+const HER2_CLASSE = `(CASE
+    WHEN h.co_seq_resultado_her2 IS NULL THEN 'na'
+    WHEN ${HER2_TXT} ~ '(^|[^0-9])3( |_)*(\\+|mais|cruz)|tres' THEN '3+'
+    WHEN ${HER2_TXT} ~ '(^|[^0-9])2( |_)*(\\+|mais|cruz)|dois|duas|equivoc|indetermin|duvidos' THEN '2+'
+    WHEN ${HER2_TXT} ~ '(^|[^0-9])1( |_)*(\\+|mais|cruz)|(^|[^a-z])um([^a-z]|$)|uma cruz' THEN '1+'
+    WHEN ${HER2_TXT} ~ '(^|[^0-9+])0([^0-9]|$)|zero' THEN '0'
+    WHEN trim(${HER2_TXT}) ~ '^[123]( [123])?$' THEN substr(trim(${HER2_TXT}), 1, 1) || '+'
+    ELSE 'outro' END)`;
+
+/**
+ * Distância em linha reta (haversine, km) entre a sede do município de
+ * residência e o serviço (coordenada do CNES ou, sem ela, a sede do município).
+ */
+const DISTANCIA_KM = `CASE WHEN mres.latitude IS NULL OR est.latitude IS NULL THEN NULL ELSE round((6371 * 2 * asin(sqrt(
+    power(sin(radians(est.latitude - mres.latitude) / 2), 2) +
+    cos(radians(mres.latitude)) * cos(radians(est.latitude)) * power(sin(radians(est.longitude - mres.longitude) / 2), 2)
+  )))::numeric, 1) END`;
 
 /** `:escopo` é trocado pela condição do recorte (ou TRUE). */
 export const SQL_PAINEL = `
@@ -74,24 +97,27 @@ SELECT
     WHEN 'EmAnalise' THEN 'Em análise'
     WHEN 'Corrigida' THEN 'Enviada'
     ELSE s.tp_status END AS situacao,
-  round((extract(epoch FROM (pa.dt_emissao - COALESCE(s.dt_envio, s.dt_solicitacao))) / 86400)::numeric, 1) AS dias_ate_parecer,
+  -- 3 casas (~1,5 min): muitos pareceres saem em minutos; com 1 casa viravam 0,0.
+  round((extract(epoch FROM (pa.dt_emissao - COALESCE(s.dt_envio, s.dt_solicitacao))) / 86400)::numeric, 3) AS dias_ate_parecer,
   CASE WHEN s.tp_status IN ('Enviada', 'EmAnalise', 'Corrigida')
     THEN round((extract(epoch FROM (now() - COALESCE(s.dt_correcao, s.dt_envio, s.dt_solicitacao))) / 86400)::numeric, 1) END AS dias_aguardando,
   COALESCE(dv.n, 0) AS n_devolucoes,
   dv.motivo AS motivo_devolucao,
   CASE WHEN s.tp_status = 'Indeferida' THEN pa.motivo END AS motivo_indeferimento,
   COALESCE(me.nome, s.ds_medicamento_resumo) AS medicamento,
-  c.sg_codigo AS cid,
-  c.ds_cid AS cid_nome,
+  COALESCE(c.sg_codigo, cr.sg_codigo) AS cid,
+  COALESCE(c.ds_cid, cr.ds_cid) AS cid_nome,
   NULLIF(trim(COALESCE(mo.sg_codigo, '') || ' ' || COALESCE(mo.ds_morfologia_tumoral, '')), '') AS morfologia,
   te.ds_tipo_estadiamento AS sistema_estadiamento,
   COALESCE(ec.ds_estadio_calculado, s.ds_estadio_clinico) AS estadio_clinico,
-  CASE
-    WHEN h.sg_codigo IS NULL THEN 'Não se aplica'
-    WHEN h.sg_codigo = '2+' AND s.ds_fish_resultado ILIKE 'pos%' THEN '2+ (FISH positivo)'
-    WHEN h.sg_codigo = '2+' AND s.ds_fish_resultado ILIKE 'neg%' THEN '2+ (FISH negativo)'
-    WHEN h.sg_codigo = '2+' THEN '2+ (sem FISH)'
-    ELSE h.sg_codigo END AS her2,
+  CASE ${HER2_CLASSE}
+    WHEN 'na' THEN 'Não se aplica'
+    WHEN '2+' THEN CASE
+      WHEN s.ds_fish_resultado ILIKE 'pos%' THEN '2+ (FISH positivo)'
+      WHEN s.ds_fish_resultado ILIKE 'neg%' THEN '2+ (FISH negativo)'
+      ELSE '2+ (sem FISH)' END
+    WHEN 'outro' THEN COALESCE(h.ds_resultado_her2, h.sg_codigo)
+    ELSE ${HER2_CLASSE} END AS her2,
   CASE s.st_recidiva WHEN 'S' THEN 'Sim' WHEN 'N' THEN 'Não' END AS recidiva,
   s.ds_linha_tratamento AS linha_tratamento,
   s.ds_finalidade_tratamento AS finalidade,
@@ -101,18 +127,18 @@ SELECT
     ELSE COALESCE(pc.ds_sigtap, 'A definir') END AS codigo_apac,
   NULLIF(trim(COALESCE(s.co_cbo, '') || ' ' || COALESCE(s.ds_cbo, '')), '') AS cbo_prescritor,
   ${REGIAO_POR_UF} AS regiao,
-  s.sg_uf_estabelecimento AS uf,
-  NULL::text AS macro_saude,
-  NULL::text AS regiao_saude,
-  NULL::text AS mun_servico,
+  COALESCE(s.sg_uf_estabelecimento, est.sg_uf) AS uf,
+  est.no_macro AS macro_saude,
+  est.no_regiao_saude AS regiao_saude,
+  est.no_municipio AS mun_servico,
   s.co_cnes AS cnes,
-  s.no_estabelecimento,
-  NULL::text AS tipo_servico,
-  s.no_municipio AS mun_residencia,
-  s.sg_uf AS uf_residencia,
-  NULL::text AS regiao_saude_residencia,
-  NULL::numeric AS lat_res, NULL::numeric AS lon_res, NULL::numeric AS lat_srv, NULL::numeric AS lon_srv,
-  NULL::numeric AS distancia_km,
+  COALESCE(s.no_estabelecimento, est.no_estabelecimento) AS no_estabelecimento,
+  est.tipo_servico,
+  COALESCE(mres.no_municipio, s.no_municipio) AS mun_residencia,
+  COALESCE(s.sg_uf, mres.sg_uf) AS uf_residencia,
+  mres.no_regiao_saude AS regiao_saude_residencia,
+  mres.latitude AS lat_res, mres.longitude AS lon_res, est.latitude AS lat_srv, est.longitude AS lon_srv,
+  ${DISTANCIA_KM} AS distancia_km,
   s.tp_sexo AS sexo,
   s.nu_idade AS idade,
   CASE WHEN s.nu_idade IS NULL THEN NULL WHEN s.nu_idade < 30 THEN 'até 29' WHEN s.nu_idade < 40 THEN '30–39'
@@ -122,11 +148,15 @@ LEFT JOIN parecer pa ON pa.co_solicitacao_apac = s.co_seq_solicitacao_apac
 LEFT JOIN devolucao dv ON dv.co_solicitacao_apac = s.co_seq_solicitacao_apac
 LEFT JOIN medicamento me ON me.co_solicitacao_apac = s.co_seq_solicitacao_apac
 LEFT JOIN apac.tb_cid c ON c.co_seq_cid = s.co_cid_principal
+-- tb_cid vazia na origem: o código é a posição na CID-10 do DATASUS (ver migration CreateCid10).
+LEFT JOIN referencia.cid10 cr ON cr.co_seq_cid = s.co_cid_principal
 LEFT JOIN apac.tb_morfologia_tumoral mo ON mo.co_seq_morfologia_tumoral = s.co_morfologia_tumoral
 LEFT JOIN apac.tb_tipo_estadiamento te ON te.co_seq_tipo_estadiamento = s.co_tipo_estadiamento
 LEFT JOIN apac.tb_estadio_calculado ec ON ec.co_seq_estadio_calculado = s.co_estadio_clinico
 LEFT JOIN apac.tb_resultado_her2 h ON h.co_seq_resultado_her2 = s.co_resultado_her2
 LEFT JOIN apac.tb_pcdt pc ON pc.co_seq_pcdt = s.co_pcdt
+LEFT JOIN territorio.estabelecimento est ON est.co_cnes = lpad(s.co_cnes, 7, '0')
+LEFT JOIN territorio.municipio mres ON mres.co_ibge6 = left(s.co_municipio_ibge, 6)
 WHERE s.dt_exclusao IS NULL AND (:escopo)
 ORDER BY s.co_seq_solicitacao_apac
 `;

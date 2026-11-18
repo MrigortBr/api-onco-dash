@@ -2,17 +2,21 @@ import { Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import type { ScopeLevel } from '../auth/profiles.js';
 import type { DataScope } from '../scope/data-scope.js';
+import { normalizarFinalidade, normalizarLinha } from './normalizar.js';
 import { COLUNAS_PAINEL, SQL_PAINEL } from './painel.sql.js';
 
 /**
- * Coluna do clone que guarda cada nível do recorte. Os níveis sem coluna
- * (macrorregião, região de saúde, município do serviço) ainda não existem
- * no banco do APAC Onco: quem tem esses perfis recebe "nada" (falha fechada)
- * até as tabelas de território serem incorporadas.
+ * Condição de cada nível do recorte. Macro, região e município vêm do
+ * território do CNES (schema `territorio`): uma solicitação cujo CNES não
+ * está carregado lá não aparece para esses perfis (falha fechada).
+ * Município: compara os 6 primeiros dígitos do IBGE (com ou sem o verificador).
  */
-const COLUNA_ESCOPO: Partial<Record<ScopeLevel, string>> = {
-  uf: 's.sg_uf_estabelecimento',
-  cnes: 's.co_cnes',
+const COLUNA_ESCOPO: Record<ScopeLevel, { coluna: string; valor?: (codigo: string) => string }> = {
+  uf: { coluna: 's.sg_uf_estabelecimento' },
+  macrorregiao: { coluna: 'est.co_macro' },
+  regiaoSaude: { coluna: 'est.co_regiao_saude' },
+  municipio: { coluna: 'left(est.co_ibge, 6)', valor: (c) => c.replace(/\D/g, '').slice(0, 6) },
+  cnes: { coluna: 's.co_cnes' },
 };
 
 export interface PainelDados {
@@ -33,7 +37,7 @@ export class PainelService {
 
   async solicitacoes(escopo: DataScope): Promise<PainelDados> {
     const atualizadoEm = await this.ultimaAtualizacao();
-    const chave = `${atualizadoEm}|${JSON.stringify(escopo)}`;
+    const chave = `${atualizadoEm}|${await this.ultimaCargaTerritorio()}|${JSON.stringify(escopo)}`;
     const emCache = this.cache.get(chave);
     if (emCache) return emCache;
 
@@ -41,10 +45,10 @@ export class PainelService {
     const params: string[] = [];
     if (escopo.tipo === 'nada') condicao = 'FALSE';
     if (escopo.tipo === 'filtro') {
-      const coluna = COLUNA_ESCOPO[escopo.nivel];
-      if (coluna) {
-        params.push(escopo.codigo);
-        condicao = `${coluna} = $1`;
+      const regra = COLUNA_ESCOPO[escopo.nivel];
+      if (regra) {
+        params.push(regra.valor ? regra.valor(escopo.codigo) : escopo.codigo);
+        condicao = `${regra.coluna} = $1`;
       } else {
         condicao = 'FALSE';
       }
@@ -55,7 +59,11 @@ export class PainelService {
       COLUNAS_PAINEL.map((c) => {
         const v = r[c];
         // numeric chega como string do driver; o painel espera número.
-        return typeof v === 'string' && (c === 'dias_ate_parecer' || c === 'dias_aguardando') ? Number(v) : v;
+        if (typeof v === 'string' && (c === 'dias_ate_parecer' || c === 'dias_aguardando')) return Number(v);
+        // Texto livre com grafias diferentes para o mesmo valor (ver normalizar.ts).
+        if (c === 'linha_tratamento') return normalizarLinha(v);
+        if (c === 'finalidade') return normalizarFinalidade(v);
+        return v;
       }),
     );
     const dados: PainelDados = { colunas: COLUNAS_PAINEL, linhas, atualizadoEm };
@@ -63,6 +71,16 @@ export class PainelService {
     if (this.cache.size >= CACHE_MAX) this.cache.clear();
     this.cache.set(chave, dados);
     return dados;
+  }
+
+  /** Muda quando o território é recarregado — entra na chave do cache. */
+  private async ultimaCargaTerritorio(): Promise<string> {
+    try {
+      const rows: Array<{ id: number | null }> = await this.dataSource.query('SELECT max(id) AS id FROM territorio.carga');
+      return String(rows[0]?.id ?? 0);
+    } catch {
+      return '0';
+    }
   }
 
   private async ultimaAtualizacao(): Promise<string | null> {
