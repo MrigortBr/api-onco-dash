@@ -86,6 +86,13 @@ function layout(p: LayoutParams): string {
 </body></html>`;
 }
 
+/**
+ * Nome do remetente que aparece na caixa de entrada. O serviço de e-mail é o
+ * mesmo do SIMDASH; sem `fromName` ele usa o padrão dele ("SIMDASH — Painel
+ * Nacional de Radioterapia"). Dá para trocar pela variável MAIL_FROM_NAME.
+ */
+const REMETENTE = process.env.MAIL_FROM_NAME?.trim() || 'OncoDash — Autorização Prévia de Medicamentos Oncológicos';
+
 async function send(to: string, subject: string, html: string): Promise<boolean> {
   const apiUrl = process.env.MAIL_API_URL;
   const apiSecret = process.env.MAIL_API_SECRET;
@@ -97,7 +104,7 @@ async function send(to: string, subject: string, html: string): Promise<boolean>
     const res = await fetch(apiUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiSecret },
-      body: JSON.stringify({ to, subject, html }),
+      body: JSON.stringify({ to, subject, html, fromName: REMETENTE }),
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) {
