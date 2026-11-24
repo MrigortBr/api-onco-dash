@@ -52,6 +52,12 @@ export class SyncController {
     const send = (msg: string, done = false, success = false) => {
       res.write(`data: ${JSON.stringify({ msg, done, success })}\n\n`);
     };
+    // 2026-11-24: sinal de vida a cada 10 s. Gravar uma tabela grande pode levar
+    // mais de 30 s sem nenhuma mensagem, e o proxy do front (rewrite /api do
+    // Next) derrubava a conexão parada ("network error" na tela, com a
+    // atualização seguindo normalmente no servidor). Linha de comentário SSE
+    // (": ..."), que o front ignora.
+    const pulso = setInterval(() => res.write(': ping\n\n'), 10_000);
     try {
       const result = await this.syncService.run((msg) => send(msg), user.id);
       send('', true, result.success);
@@ -59,6 +65,7 @@ export class SyncController {
       send(`[ERRO] ${err instanceof Error ? err.message : String(err)}`);
       send('', true, false);
     } finally {
+      clearInterval(pulso);
       res.end();
     }
   }

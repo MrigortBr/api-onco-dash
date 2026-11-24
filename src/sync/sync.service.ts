@@ -196,24 +196,49 @@ export class SyncService {
     this.running = true;
     const { schema, ...clientCfg } = cfg;
     const source = new Client(clientCfg);
+    // Sem este listener, um erro assíncrono da conexão (ex.: a origem derrubar a
+    // sessão por timeout) vira 'Unhandled error event' e derruba a API inteira.
+    source.on('error', (err) => log(`[AVISO] Conexão com a origem: ${err.message}`));
+    let origemAberta = false;
     const tables: SyncTableResult[] = [];
     const errosParciais: string[] = [];
 
     try {
       log('Conectando ao banco do APAC Onco...');
       await source.connect();
+      origemAberta = true;
       await source.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
       log(`Conexão estabelecida (leitura em snapshot, schema ${schema}).`);
 
+      // 2026-11-24: a origem derrubava a sessão com "idle-in-transaction timeout"
+      // porque a transação de leitura ficava aberta (parada) enquanto o clone era
+      // gravado tabela a tabela. Agora lê TUDO primeiro (mesmo snapshot), encerra
+      // a conexão com a origem e só então grava — a origem nunca fica ociosa
+      // dentro da transação.
+      const lidas = new Map<string, Record<string, unknown>[]>();
+      for (const tabela of TABELAS_ORIGEM) {
+        const { rows } = await source.query<Record<string, unknown>>(`SELECT * FROM "${schema}"."${tabela.name}"`);
+        lidas.set(tabela.name, rows);
+        log(`${tabela.name}: ${rows.length} linha(s) lida(s) da origem`);
+      }
+      const { rows: usuariosOrigem } = await source.query<Record<string, string | null>>(
+        `SELECT ${COLUNAS_USUARIO.join(', ')} FROM "${schema}"."tb_usuario" ORDER BY co_seq_usuario`,
+      );
+      log(`tb_usuario: ${usuariosOrigem.length} linha(s) lida(s) da origem`);
+      await source.query('COMMIT');
+      await source.end();
+      origemAberta = false;
+      log('Leitura da origem concluída — conexão encerrada. Gravando no OncoDash...');
+
       await this.dataSource.transaction(async (em) => {
         for (const tabela of TABELAS_ORIGEM) {
-          tables.push(await this.syncTabela(em, source, schema, tabela, log));
+          tables.push(await this.syncTabela(em, lidas.get(tabela.name) ?? [], tabela, log));
         }
         // Usuários num SAVEPOINT: um problema só neles (ex.: login da origem igual ao de
         // uma conta criada no OncoDash) não impede os dados do painel de atualizarem.
         await em.query('SAVEPOINT sync_usuarios');
         try {
-          tables.push(await this.syncUsuarios(em, source, schema, log));
+          tables.push(await this.syncUsuarios(em, usuariosOrigem, log));
           await em.query('RELEASE SAVEPOINT sync_usuarios');
         } catch (err) {
           await em.query('ROLLBACK TO SAVEPOINT sync_usuarios');
@@ -246,8 +271,10 @@ export class SyncService {
       return result;
     } finally {
       this.running = false;
-      await source.query('ROLLBACK').catch(() => null);
-      await source.end().catch(() => null);
+      if (origemAberta) {
+        await source.query('ROLLBACK').catch(() => null);
+        await source.end().catch(() => null);
+      }
     }
   }
 
@@ -255,12 +282,10 @@ export class SyncService {
 
   private async syncTabela(
     em: EntityManager,
-    source: Client,
-    schema: string,
+    rows: Record<string, unknown>[],
     t: TabelaOrigem,
     log: (msg: string) => void,
   ): Promise<SyncTableResult> {
-    const { rows } = await source.query<Record<string, unknown>>(`SELECT * FROM "${schema}"."${t.name}"`);
     const destino = await this.colunasDestino(em, t.name);
 
     if (rows.length === 0) {
@@ -365,13 +390,9 @@ export class SyncService {
    */
   private async syncUsuarios(
     em: EntityManager,
-    source: Client,
-    schema: string,
+    rows: Record<string, string | null>[],
     log: (msg: string) => void,
   ): Promise<SyncTableResult> {
-    const { rows } = await source.query<Record<string, string | null>>(
-      `SELECT ${COLUNAS_USUARIO.join(', ')} FROM "${schema}"."tb_usuario" ORDER BY co_seq_usuario`,
-    );
     if (rows.length === 0) {
       log('[AVISO] tb_usuario: a origem veio vazia — usuários mantidos como estão.');
       return { name: 'tb_usuario', read: 0, written: 0 };
